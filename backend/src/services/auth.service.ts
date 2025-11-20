@@ -1,146 +1,72 @@
 import bcrypt from "bcrypt";
-import type { ClientSession } from "mongoose";
-import { User, type UserDocument } from "../models/user.model.js";
-import {
-  issueAccessToken,
-  issueRefreshTokenForDevice,
-  revokeAllForUser,
-  revokeRefreshTokenByJti,
-  rotateRefreshToken,
-  verifyRefreshTokenSignature
-} from "./token.service.js";
+import { UserModel } from "../models/user.model.js";
+import * as TokenService from "./token.service.js";
 
-export type RegisterOpts = {
-  deviceInfo?: string;
-  ip?: string;
-  session?: ClientSession;
-  bcryptRounds?: number;
-};
+type AuthMeta = { ip: string; deviceInfo: string };
 
-export type AuthResult = {
-  user: {
-    id: string;
-    email: string;
-    createdAt?: Date;
-  };
-  accessToken: string;
-  refreshToken: string;
-  refreshJti: string;
-  refreshExpiresAt: Date;
-};
+export async function registerUser(name: string, email: string, pass: string, meta: AuthMeta) {
+  // 1. Check existence
+  const exists = await UserModel.exists({ email: email.toLowerCase().trim() });
+  if (exists) throw new Error("EmailExists");
 
-/**
- * registerUser
- *
- * - Creates a new user (hashed password)
- * - Issues access + per-device refresh token (stored by token.service)
- * - Returns minimal user DTO + tokens
- *
- * Throws:
- * - Error with message "EmailExists" when email already registered
- * - Other errors bubble up (DB errors, etc.)
- */
-export async function registerUser(
-  name: string,
-  email: string,
-  password: string,
-  opts: RegisterOpts = {}
-): Promise<AuthResult> {
-  const rounds = opts.bcryptRounds ?? 12;
+  // 2. Hash Password
+  const passwordHash = await bcrypt.hash(pass, 12);
 
-  const normalizedEmail = email.trim().toLowerCase();
-  
-  const existing = await User.findOne({ email: normalizedEmail }).session(opts.session ?? null);
-  if (existing) {
-    const err = new Error("EmailExists");
-    (err as any).code = "EmailExists";
-    throw err;
-  }
+  // 3. Create User
+  const user = await UserModel.create({
+    name,
+    email: email.toLowerCase().trim(),
+    passwordHash
+  });
 
-  // create user with hashed password
-  const passwordHash = await bcrypt.hash(password, rounds);
-
-  // Persist new user. Use create to ensure unique index enforcement.
-  const created = await User.create(
-    [
-      {
-        name,
-        email: normalizedEmail,
-        passwordHash,
-        tokenVersion: 0
-      }
-    ],
-    { session: opts.session }
-  );
-
-  // User.create with array returns array of docs
-  const userDoc = created[0] as UserDocument;
-  const userId = userDoc.id ?? userDoc._id.toString();
-
-  // Issue access token and per-device refresh token (persisted by token.service)
-  const accessToken = issueAccessToken(userId);
-  const refreshOpts: { deviceInfo?: string; ip?: string; session?: ClientSession } = {};
-  if (opts.deviceInfo !== undefined) refreshOpts.deviceInfo = opts.deviceInfo;
-  if (opts.ip !== undefined) refreshOpts.ip = opts.ip;
-  if (opts.session !== undefined) refreshOpts.session = opts.session;
-  const { token: refreshToken, jti: refreshJti, expiresAt: refreshExpiresAt } =
-    await issueRefreshTokenForDevice(userId, refreshOpts);
+  // 4. Auto-Login: Issue Tokens
+  const userId = user._id.toString();
+  const accessToken = TokenService.signAccessToken(userId);
+  const { token: refreshToken, expiresAt } = await TokenService.signRefreshToken(userId, meta);
 
   return {
-    user: {
-      id: userId,
-      email: userDoc.email,
-      createdAt: userDoc.createdAt
-    },
+    user: { id: userId, email: user.email, name: user.name },
     accessToken,
     refreshToken,
-    refreshJti,
-    refreshExpiresAt
+    refreshExpiresAt: expiresAt
   };
 }
 
-/**
- * Login flow: validate credentials, issue tokens and store refresh record
- */
-export async function loginUser(email: string, password: string, opts?: { deviceInfo?: string; ip?: string }) {
-  const user = await User.findOne({ email });
+export async function loginUser(email: string, pass: string, meta: AuthMeta) {
+  // 1. Find User
+  const user = await UserModel.findOne({ email: email.toLowerCase().trim() });
   if (!user) throw new Error("InvalidCredentials");
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) throw new Error("InvalidCredentials");
 
-  const accessToken = issueAccessToken(user.id ?? user._id.toString());
-  const { token: refreshToken, jti, expiresAt } = await issueRefreshTokenForDevice(user.id ?? user._id.toString(), { deviceInfo: opts?.deviceInfo ?? "", ip: opts?.ip ?? "" });
+  // 2. Verify Password
+  const isValid = await bcrypt.compare(pass, user.passwordHash);
+  if (!isValid) throw new Error("InvalidCredentials");
 
-  return { user, accessToken, refreshToken, expiresAt, jti };
+  // 3. Issue Tokens
+  const userId = user._id.toString();
+  const accessToken = TokenService.signAccessToken(userId);
+  const { token: refreshToken, expiresAt } = await TokenService.signRefreshToken(userId, meta);
+
+  return {
+    user: { id: userId, email: user.email, name: user.name },
+    accessToken,
+    refreshToken,
+    refreshExpiresAt: expiresAt
+  };
 }
 
-/**
- * Refresh endpoint: client sends refreshToken; we verify signature and rotate record
- */
-export async function refreshTokens(refreshJwt: string, opts?: { deviceInfo?: string; ip?: string }) {
-  const payload = verifyRefreshTokenSignature(refreshJwt);
-  if (!payload) throw new Error("InvalidRefreshToken");
-
-  // payload.jti must exist
-  if (!payload.jti || !payload.sub) throw new Error("InvalidRefreshToken");
-
-  // rotate and return new tokens (rotation function checks DB and marks old revoked)
-  const rotated = await rotateRefreshToken(payload.jti, { deviceInfo: opts?.deviceInfo ?? "", ip: opts?.ip ?? "" });
-  return rotated; // { accessToken, refreshToken, jti, expiresAt }
+export async function refreshTokens(token: string, meta: AuthMeta) {
+  // Calls the rotation logic in TokenService
+  return TokenService.rotateRefreshToken(token, meta);
 }
 
-/**
- * Logout current device: client provides refreshToken (or we parse jti from it)
- */
-export async function logout(refreshJwt: string) {
-  const payload = verifyRefreshTokenSignature(refreshJwt);
-  if (!payload || !payload.jti) return;
-  await revokeRefreshTokenByJti(payload.jti);
+export async function logout(token: string) {
+  try {
+    const payload = TokenService.verifyRefreshToken(token);
+    await TokenService.revokeToken(payload.jti);
+  } catch (e) {
+    // Ignore errors during logout (e.g., token already invalid)
+    // We don't want to block the user from "logging out" on the client side
+  }
 }
 
-/**
- * Logout all (global): authenticated endpoint
- */
-export async function logoutAll(userId: string) {
-  await revokeAllForUser(userId);
-}
+export const logoutAll = TokenService.revokeAllForUser;

@@ -1,127 +1,135 @@
 import type { Request, Response } from "express";
-import bcrypt from "bcrypt";
-import jwt from 'jsonwebtoken'
-import User from "../models/user.model.js";
 import * as authService from "../services/auth.service.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { env } from "../config/env.js";
+import type { LoginInput, RegisterInput, TokenInput } from "../schemas/auth.schema.js";
 
-/**
- * POST /auth/register
- * Expects req.body to contain { email, password }
- * Validation should run before this controller (Zod/validate middleware)
- */
-export const register = asyncHandler(async (req: Request, res: Response) => {
-  const { name, email, password } = req.body as { name: string; email: string; password: string };
+// Determine if we are in a strict production environment or dev/codespace
+const isProduction = env.NODE_ENV === "production";
+
+const getCookieOptions = () => ({
+  httpOnly: true,
+  // Codespaces requires 'secure: true' because it is HTTPS.
+  // In Production, it is also HTTPS.
+  // Only false if testing on http://localhost without SSL.
+  secure: true,
+
+  // CRITICAL FOR CODESPACES:
+  // 'Strict' blocks cookies if frontend/backend domains differ (common in Codespaces).
+  // 'None' allows cross-site cookies (requires secure: true).
+  sameSite: isProduction ? "strict" as const : "none" as const,
+
+  maxAge: 90 * 24 * 60 * 60 * 1000, // 90 days
+  path: "/"
+});
+
+const getMeta = (req: Request) => ({
+  ip: req.ip || (req.headers['x-forwarded-for'] as string) || "",
+  deviceInfo: (req.headers["x-device-info"] as string) || (req.headers["user-agent"] as string) || "Unknown"
+});
+
+export const login = asyncHandler(async (req: Request<{}, {}, LoginInput>, res: Response) => {
+  const { email, password } = req.body;
+  // Check if client is Mobile (you will set this header in your RN ApiClient)
+  const isMobile = req.headers["x-client-platform"] === "mobile";
+
+  const result = await authService.loginUser(email, password, getMeta(req));
+
+  // 1. WEB STRATEGY: Set HttpOnly Cookie
+  if (!isMobile) {
+    res.cookie("refreshToken", result.refreshToken, getCookieOptions());
+  }
+
+  // 2. RESPONSE
+  res.status(200).json({
+    success: true,
+    data: {
+      user: result.user,
+      accessToken: result.accessToken,
+      // If Mobile: Send Refresh Token in JSON. 
+      // If Web: Send null/undefined (so client logic knows it's in a cookie) OR send it anyway but warn not to use it.
+      // Best practice: Only send in JSON for mobile.
+      refreshToken: isMobile ? result.refreshToken : undefined,
+      refreshExpiresAt: result.refreshExpiresAt
+    }
+  });
+});
+
+export const register = asyncHandler(async (req: Request<{}, {}, RegisterInput>, res: Response) => {
+  const { name, email, password } = req.body;
+  const isMobile = req.headers["x-client-platform"] === "mobile";
+
+  const result = await authService.registerUser(name, email, password, getMeta(req));
+
+  if (!isMobile) {
+    res.cookie("refreshToken", result.refreshToken, getCookieOptions());
+  }
+
+  res.status(201).json({
+    success: true,
+    data: {
+      user: result.user,
+      accessToken: result.accessToken,
+      refreshToken: isMobile ? result.refreshToken : undefined,
+      refreshExpiresAt: result.refreshExpiresAt
+    }
+  });
+});
+
+export const refresh = asyncHandler(async (req: Request<{}, {}, TokenInput>, res: Response) => {
+  // 1. Try getting token from Cookie (Web) OR Body (Mobile)
+  const incomingToken = req.cookies?.refreshToken || req.body.refreshToken;
+
+  if (!incomingToken) return res.status(401).json({ error: "Missing Refresh Token" });
+
+  const isMobile = req.headers["x-client-platform"] === "mobile";
 
   try {
-    const result = await authService.registerUser(name, email, password, {
-      deviceInfo: String(req.headers["user-agent"] ?? ""),
-      ip: req.ip ?? ""
-    });
+    const result = await authService.refreshTokens(incomingToken, getMeta(req));
 
-    return res.status(201).json({
+    // Rotate Cookie for Web
+    if (!isMobile) {
+      res.cookie("refreshToken", result.refreshToken, getCookieOptions());
+    }
+
+    res.status(200).json({
+      success: true,
       data: {
-        user: result.user,
         accessToken: result.accessToken,
-        refreshToken: result.refreshToken,
-        refreshExpiresAt: result.refreshExpiresAt
+        refreshToken: isMobile ? result.refreshToken : undefined,
+        expiresAt: result.expiresAt
       }
     });
-  } catch (err: any) {
-    if (err?.code === "EmailExists" || err?.message === "EmailExists") {
-      return res.status(409).json({ error: "EmailExists", message: "Email is already registered" });
-    }
-
-    // Handle Mongo duplicate key race that results in a MongoError
-    if (err?.code === 11000) {
-      return res.status(409).json({ error: "EmailExists", message: "Email is already registered" });
-    }
-
-    throw err;
+  } catch (err) {
+    // Clear cookie on error (Web)
+    if (!isMobile) res.clearCookie("refreshToken");
+    return res.status(403).json({ error: "Invalid session" });
   }
 });
 
-// POST /auth/login
-export const login = asyncHandler(async (req: Request, res: Response) => {
-  const { email, password } = req.body as { email: string; password: string };
-  const result = await authService.loginUser(email, password, {
-    deviceInfo: String(req.headers["user-agent"] ?? ""),
-    ip: req.ip ?? ""
-  });
-
-  return res.status(200).json({
-    data: {
-      user: { id: result.user.id, email: result.user.email },
-      accessToken: result.accessToken,
-      refreshToken: result.refreshToken,
-      refreshExpiresAt: result.expiresAt
-    }
-  });
-});
-
-// POST /auth/refresh
-// Client sends { refreshToken } in body
-export const refresh = asyncHandler(async (req: Request, res: Response) => {
-  const { refreshToken } = req.body as { refreshToken?: string };
-  if (!refreshToken) return res.status(400).json({ error: "MissingRefreshToken" });
-
-  const rotated = await authService.refreshTokens(refreshToken, {
-    deviceInfo: String(req.headers["user-agent"] ?? ""),
-    ip: req.ip ?? ""
-  });
-
-  return res.status(200).json({
-    data: {
-      accessToken: rotated.accessToken,
-      refreshToken: rotated.refreshToken,
-      refreshExpiresAt: rotated.expiresAt
-    }
-  });
-});
-
-// POST /auth/logout
-// Client sends { refreshToken } or uses authenticated access token to identify session
 export const logout = asyncHandler(async (req: Request, res: Response) => {
-  const { refreshToken } = req.body as { refreshToken?: string };
-  if (!refreshToken) return res.status(400).json({ error: "MissingRefreshToken" });
+  const incomingToken = req.cookies?.refreshToken || req.body.refreshToken;
+  const isMobile = req.headers["x-client-platform"] === "mobile";
 
-  await authService.logout(refreshToken);
-  // Client must delete tokens locally
-  return res.status(200).json({ data: { message: "Logged out" } });
+  if (incomingToken) {
+    await authService.logout(incomingToken);
+  }
+
+  // Clear Cookie (Web)
+  if (!isMobile) {
+    res.clearCookie("refreshToken");
+  }
+
+  res.status(200).json({ success: true, message: "Logged out" });
 });
 
-// POST /auth/logout-all
-// Protected endpoint: caller must be authenticated (use requireAuth middleware to set req.user.id)
+// POST /auth/logout-all (Protected Route)
 export const logoutAll = asyncHandler(async (req: Request, res: Response) => {
-  const userId = (req as any).user?.id as string | undefined;
+  // 'req.user' is populated by your authentication middleware
+  const userId = (req as any).user?.id;
+
   if (!userId) return res.status(401).json({ error: "Unauthenticated" });
 
   await authService.logoutAll(userId);
-  return res.status(200).json({ data: { message: "All sessions logged out" } });
+  res.status(200).json({ success: true, message: "All sessions terminated" });
 });
-
-// /*
-//  Optional session management endpoints (requires session.service implementation)
-//  - GET /auth/sessions
-//  - DELETE /auth/sessions/:jti
-// */
-
-// // GET /auth/sessions
-// export const sessions = asyncHandler(async (req: Request, res: Response) => {
-//   const userId = (req as any).user?.id as string | undefined;
-//   if (!userId) return res.status(401).json({ error: "Unauthenticated" });
-
-//   const rows = await listSessions(userId);
-//   return res.status(200).json({ data: rows });
-// });
-
-// // DELETE /auth/sessions/:jti
-// export const revokeSession = asyncHandler(async (req: Request, res: Response) => {
-//   const userId = (req as any).user?.id as string | undefined;
-//   const { jti } = req.params as { jti: string };
-//   if (!userId) return res.status(401).json({ error: "Unauthenticated" });
-
-//   // optional safety: verify the jti belongs to the user in session.service
-//   await authService.logout(jti, userId);
-//   return res.status(200).json({ data: { message: "Session revoked" } });
-// });

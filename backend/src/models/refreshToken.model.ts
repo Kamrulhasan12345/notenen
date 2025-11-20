@@ -1,33 +1,17 @@
-import  { Schema, model, type HydratedDocument, type Types } from "mongoose";
+import { Schema, model, Types, type InferSchemaType } from "mongoose";
 
-export interface IRefreshToken {
-  jti: string;
-  userId: Types.ObjectId;
-  deviceInfo?: string;
-  issuedAt: Date;
-  lastUsedAt?: Date;
-  expiresAt: Date;
-  revoked: boolean;
-  replacedBy?: string | null;
-  ip?: string | null;
-}
-
-export type RefreshTokenDocument = HydratedDocument<IRefreshToken>;
-
-const RefreshTokenSchema = new Schema<IRefreshToken>({
-  jti: { type: String, required: true, unique: true, index: true },
-  userId: { type: Schema.Types.ObjectId, ref: 'NoteNenUser', required: true, index: true },
-  deviceInfo: {type: String},
-  issuedAt: { type: Date, required: true },
-  lastUsedAt: { type: Date },
-  expiresAt: { type: Date, required: true, index: true },
+const RefreshTokenSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, ref: 'NoteNenUser', required: true },
+  jti: { type: String, required: true, unique: true },
   revoked: { type: Boolean, default: false },
-  replacedBy: { type: String, default: null },
-  ip: { type: String, default: null }
-});
+  replacedBy: { type: String, default: null }, // Points to the new JTI if rotated
+  expiresAt: { type: Date, required: true },
+  deviceInfo: { type: String, default: "Unknown" },
+  ip: { type: String, default: null },
+}, { timestamps: true });
 
+// TTL Index: Automatically remove document 0 seconds after 'expiresAt'
 RefreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-export const RefreshToken = model<IRefreshToken>('NoteNenRefreshToken', RefreshTokenSchema);
-
-export default RefreshToken;
+export type RefreshToken = InferSchemaType<typeof RefreshTokenSchema>;
+export const RefreshTokenModel = model('NoteNenRefreshToken', RefreshTokenSchema);

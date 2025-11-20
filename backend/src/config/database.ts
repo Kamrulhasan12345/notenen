@@ -8,12 +8,6 @@ export const connectDB = async (): Promise<void> => {
     }
     await mongoose.connect(mongoURI);
     console.log("[MONGODB]: MongoDB connected");
-
-    process.on('SIGINT', async () => {
-      await mongoose.connection.close();
-      console.log("[MONGODB]: MongoDB connection closed due to app termination");
-      process.exit(0);
-    });
   } catch (err) {
     throw new Error(`[MONGODB]: MongoDB connection error: ${err}`);
   }

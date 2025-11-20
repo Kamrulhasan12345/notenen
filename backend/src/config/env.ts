@@ -1,98 +1,44 @@
-import path from "path";
 import dotenv from "dotenv";
 import { z } from "zod";
 
-/**
- * Load .env files in this order (later overrides earlier):
- *  - .env
- *  - .env.<NODE_ENV>
- *  - .env.<NODE_ENV>.local
- *
- * dotenv.config() by default reads process.cwd()/.env. We load the environment-specific
- * file explicitly so you can have .env.development, .env.test, .env.production, etc.
- */
-const NODE_ENV = process.env.NODE_ENV ?? "development";
-const baseEnv = path.resolve(process.cwd(), ".env");
-const envFiles = [
-  baseEnv,
-  path.resolve(process.cwd(), `.env.${NODE_ENV}`),
-  path.resolve(process.cwd(), `.env.${NODE_ENV}.local`),
-];
-
-for (const f of envFiles) {
-  // dotenv.config is safe if file missing; it only sets variables that aren't already present
-  dotenv.config({ path: f });
-}
+dotenv.config();
 
 /**
- * Validation schema (Zod)
- * Keep everything required that the app needs to run; provide sensible defaults where appropriate.
+ * Custom validator for duration strings (e.g., "15m", "7h", "7d")
  */
+const durationSchema = z.custom<`${number}${'s' | 'm' | 'h' | 'd'}`>((val) => {
+  return typeof val === "string" && /^\d+[smhd]$/.test(val);
+}, "Invalid duration format (must be like '15m', '1h', '7d')");
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z
-    .string()
-    .transform((s) => Number(s))
-    .refine((n) => Number.isInteger(n) && n > 0 && n < 65536, { message: "PORT must be a valid port number" })
-    .default(4000),
-  CORS_ORIGIN: z.string().min(1).default("*"),
-
+  PORT: z.coerce.number().default(4000),
   MONGO_URI: z.string().min(1),
+  JWT_SECRET: z.string().min(16),
+  JWT_REFRESH_SECRET: z.string().min(16),
+  // Enforce specific format types
+  TOKEN_EXPIRES_IN: durationSchema.default("15m"),
+  REFRESH_EXPIRES_IN: durationSchema.default("90d"),
+});
 
-  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
-  JWT_REFRESH_SECRET: z.string().min(16, "JWT_REFRESH_SECRET must be at least 16 characters"),
-  TOKEN_EXPIRES_IN: z.string().default("15m"),
-  REFRESH_EXPIRES_IN: z.string().default("7d"),
-
-  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
-
-  // Optional flags
-  DISABLE_EMAIL: z.preprocess((v) => (v === "true" ? true : v === "false" ? false : v), z.boolean()).optional(),
-}).strict();
+export const env = EnvSchema.parse(process.env);
 
 /**
- * Parse and export
+ * Helper to convert "15m", "7d" into a future Date object for the Database
  */
-const parsed = EnvSchema.safeParse(process.env);
+export const getExpiryDate = (duration: string): Date => {
+  const match = duration.match(/^(\d+)([smhd])$/);
+  if (!match) throw new Error("Invalid duration string");
 
-if (!parsed.success) {
-  console.error("Invalid environment configuration:");
-  // Print human-friendly error list
-  console.error(parsed.error.format());
-  // Fail fast — don't let the app run with bad config
-  process.exit(1);
-}
+  const value = parseInt(match[1]!, 10);
+  const unit = match[2]!;
+  const now = Date.now();
 
-/**
- * Typed env exported across the app
- */
-export const env = parsed.data;
-
-/**
- * Helper: convert duration strings like "15m", "7d" to milliseconds
- * Used by token service or cookie helpers
- */
-export function durationToMs(value: string): number {
-  const m = /^(\d+)(s|m|h|d)$/.exec(value);
-  if (!m) return 0;
-  const n = Number(m[1]);
-  switch (m[2]) {
-    case "s":
-      return n * 1000;
-    case "m":
-      return n * 60_000;
-    case "h":
-      return n * 3_600_000;
-    case "d":
-      return n * 86_400_000;
-    default:
-      return 0;
+  switch (unit) {
+    case 's': return new Date(now + value * 1000);
+    case 'm': return new Date(now + value * 60 * 1000);
+    case 'h': return new Date(now + value * 60 * 60 * 1000);
+    case 'd': return new Date(now + value * 24 * 60 * 60 * 1000);
+    default: return new Date(now);
   }
-}
-
-/**
- * Example typed usage:
- * import { env } from "../config/env.js";
- * const port: number = env.PORT;
- */
-export type Env = typeof env;
+};

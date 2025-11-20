@@ -1,148 +1,109 @@
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import type { ClientSession } from "mongoose";
-import { RefreshToken } from "../models/refreshToken.model.js";
-import { User } from "../models/user.model.js";
-import { env, durationToMs, /* or durationStringToSeconds if you use it */ } from "../config/env.js";
+import { RefreshTokenModel } from "../models/refreshToken.model.js";
+import { UserModel } from "../models/user.model.js";
+import { env, getExpiryDate } from "../config/env.js";
+
+// Types
+type AccessPayload = { sub: string }; // 'sub' is standard for User ID
+type RefreshPayload = { sub: string; jti: string };
+type TokenMeta = { ip: string; deviceInfo: string };
 
 /**
- * JWT payload types
+ * Issue a short-lived Access Token (Stateless)
  */
-export type AccessPayload = { sub: string; iat?: number; exp?: number; };
-export type RefreshPayload = { sub: string; jti: string; iat?: number; exp?: number; tv?: number; };
+export const signAccessToken = (userId: string) => {
+  return jwt.sign(
+    { sub: userId } as AccessPayload,
+    env.JWT_SECRET,
+    { expiresIn: env.TOKEN_EXPIRES_IN }
+  );
+};
 
 /**
- * Issue access token (short lived)
+ * Issue a long-lived Refresh Token (Stateful)
+ * Creates a DB record and returns the signed JWT.
  */
-export function issueAccessToken(userId: string) {
-  const payload = { sub: userId };
-  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: durationToMs(env.TOKEN_EXPIRES_IN) });
-}
-
-/**
- * Create refresh token record + signed JWT (per-device)
- * Returns { token, jti }
- */
-export async function issueRefreshTokenForDevice(userId: string, opts?: { deviceInfo?: string; ip?: string; session?: ClientSession }) {
+export const signRefreshToken = async (userId: string, meta: TokenMeta) => {
   const jti = uuidv4();
-  const now = new Date();
-  // compute expiresAt as Date
-  const expiresAt = new Date(Date.now() + durationToMs(env.REFRESH_EXPIRES_IN));
+  const expiresAt = getExpiryDate(env.REFRESH_EXPIRES_IN);
 
-  // persist record
-  await RefreshToken.create([{
-    jti,
+  await RefreshTokenModel.create({
     userId,
-    deviceInfo: opts?.deviceInfo,
-    issuedAt: now,
+    jti,
     expiresAt,
-    revoked: false,
-    ip: opts?.ip ?? null
-  }], { session: opts?.session });
+    ip: meta.ip,
+    deviceInfo: meta.deviceInfo,
+  });
 
-  const payload: RefreshPayload = { sub: userId, jti };
-  const token = jwt.sign(payload, env.JWT_REFRESH_SECRET, { expiresIn: durationToMs(env.REFRESH_EXPIRES_IN) });
+  const token = jwt.sign(
+    { sub: userId, jti } as RefreshPayload,
+    env.JWT_REFRESH_SECRET,
+    { expiresIn: env.REFRESH_EXPIRES_IN }
+  );
+
   return { token, jti, expiresAt };
-}
+};
 
 /**
- * Verify access token (returns payload or null)
+ * Verify Refresh Token and Decode
  */
-export function verifyAccessToken(token: string): AccessPayload | null {
-  try {
-    return jwt.verify(token, env.JWT_SECRET) as AccessPayload;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Verify refresh token signature only (returns payload) — no DB checks here
- */
-export function verifyRefreshTokenSignature(token: string): RefreshPayload | null {
+export const verifyRefreshToken = (token: string): RefreshPayload => {
   try {
     return jwt.verify(token, env.JWT_REFRESH_SECRET) as RefreshPayload;
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error("Invalid or Expired Token");
   }
-}
+};
 
 /**
- * Rotate a refresh token: consume the old jti, create a new one, return new tokens.
- * Ensures atomicity if you pass a Mongoose session.
+ * Refresh Token Rotation with Reuse Detection
  */
-export async function rotateRefreshToken(oldJti: string, opts?: { deviceInfo?: string; ip?: string; session?: ClientSession }) {
-  // find active token record
-  const rec = await RefreshToken.findOne({ jti: oldJti }).session(opts?.session ?? null);
-  if (!rec || rec.revoked) throw new Error("InvalidRefreshToken");
+export const rotateRefreshToken = async (incomingToken: string, meta: TokenMeta) => {
+  const payload = verifyRefreshToken(incomingToken);
 
-  // Ensure token not expired
-  if (rec.expiresAt.getTime() <= Date.now()) {
-    // mark as revoked for safety
-    rec.revoked = true;
-    await rec.save();
-    throw new Error("RefreshTokenExpired");
+  const oldToken = await RefreshTokenModel.findOne({ jti: payload.jti });
+
+  // 1. REUSE DETECTION: If token doesn't exist or was already revoked/replaced
+  if (!oldToken || oldToken.revoked) {
+    // Security Alert: Someone is using a dead token. Revoke EVERYTHING for this user.
+    await RefreshTokenModel.updateMany({ userId: payload.sub }, { revoked: true });
+    throw new Error("Security Alert: Token reuse detected. All sessions terminated.");
   }
 
-  // Create new jti and persist new record; mark old replacedBy + revoked
-  const newJti = uuidv4();
-  const now = new Date();
-  const newExpires = new Date(Date.now() + durationToMs(env.REFRESH_EXPIRES_IN));
+  // 2. Create NEW Token
+  const { token: newRefreshToken, jti: newJti, expiresAt } = await signRefreshToken(payload.sub, meta);
 
-  // Use transaction-aware writes if available
-  rec.revoked = true;
-  rec.replacedBy = newJti;
-  rec.lastUsedAt = now;
-  await rec.save({ session: opts?.session ?? null });
+  // 3. Invalidate OLD Token and link to NEW Token
+  oldToken.revoked = true;
+  oldToken.replacedBy = newJti;
+  await oldToken.save();
 
-  await RefreshToken.create([{
-    jti: newJti,
-    userId: rec.userId,
-    deviceInfo: opts?.deviceInfo ?? rec.deviceInfo,
-    issuedAt: now,
-    lastUsedAt: now,
-    expiresAt: newExpires,
-    revoked: false,
-    ip: opts?.ip ?? rec.ip ?? null
-  }], { session: opts?.session });
-
-  // new refresh token string
-  const newRefreshJwt = jwt.sign({ sub: rec.userId.toString(), jti: newJti }, env.JWT_REFRESH_SECRET, { expiresIn: durationToMs(env.REFRESH_EXPIRES_IN) });
-  const newAccessJwt = jwt.sign({ sub: rec.userId.toString() }, env.JWT_SECRET, { expiresIn: durationToMs(env.TOKEN_EXPIRES_IN) });
+  // 4. Issue new Access Token
+  const newAccessToken = signAccessToken(payload.sub);
 
   return {
-    accessToken: newAccessJwt,
-    refreshToken: newRefreshJwt,
-    jti: newJti,
-    expiresAt: newExpires
+    accessToken: newAccessToken,
+    refreshToken: newRefreshToken,
+    expiresAt
   };
-}
+};
 
 /**
- * Revoke a single refresh token by jti
+ * Revoke a specific token (Logout)
  */
-export async function revokeRefreshTokenByJti(jti: string) {
-  await RefreshToken.updateOne({ jti }, { $set: { revoked: true } });
-}
+export const revokeToken = async (jti: string) => {
+  await RefreshTokenModel.updateOne({ jti }, { revoked: true });
+};
 
 /**
- * Revoke all refresh tokens for a user (per-device plus bump tokenVersion as global kill)
+ * Revoke all tokens for a user (Global Logout)
  */
-export async function revokeAllForUser(userId: string) {
-  await RefreshToken.updateMany({ userId }, { $set: { revoked: true } });
-  await User.findByIdAndUpdate(userId, { $inc: { tokenVersion: 1 } });
-}
+export const revokeAllForUser = async (userId: string) => {
+  // 1. Mark all refresh tokens as revoked
+  await RefreshTokenModel.updateMany({ userId }, { revoked: true });
 
-/**
- * Helper to convert refresh-expires into cookie options if you want to set httpOnly cookie
- */
-export function createRefreshCookieOptions() {
-  const maxAgeMs = durationToMs(env.REFRESH_EXPIRES_IN);
-  return {
-    httpOnly: true,
-    secure: env.NODE_ENV === "production",
-    sameSite: "strict" as const,
-    path: "/api/auth/refresh",
-    maxAge: Math.floor(maxAgeMs)
-  };
-}
+  // 2. Increment tokenVersion on User (invalidates all stateless Access Tokens instantly)
+  // Note: Your authentication middleware needs to check this version!
+  await UserModel.findByIdAndUpdate(userId, { $inc: { tokenVersion: 1 } });
+};
