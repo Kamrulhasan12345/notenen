@@ -15,3 +15,4 @@ RefreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export type RefreshToken = InferSchemaType<typeof RefreshTokenSchema>;
 export const RefreshTokenModel = model('NoteNenRefreshToken', RefreshTokenSchema);
+export default RefreshTokenModel;
