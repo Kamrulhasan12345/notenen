@@ -21,7 +21,7 @@ export async function registerUser(name: string, email: string, pass: string, me
 
   // 4. Auto-Login: Issue Tokens
   const userId = user._id.toString();
-  const accessToken = TokenService.signAccessToken(userId);
+  const accessToken = TokenService.signAccessToken(userId, 0);
   const { token: refreshToken, expiresAt } = await TokenService.signRefreshToken(userId, meta);
 
   return {
@@ -43,7 +43,7 @@ export async function loginUser(email: string, pass: string, meta: AuthMeta) {
 
   // 3. Issue Tokens
   const userId = user._id.toString();
-  const accessToken = TokenService.signAccessToken(userId);
+  const accessToken = TokenService.signAccessToken(userId, user.tokenVersion);
   const { token: refreshToken, expiresAt } = await TokenService.signRefreshToken(userId, meta);
 
   return {
