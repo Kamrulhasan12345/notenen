@@ -15,7 +15,7 @@ app.use(cors({
     const allowedPatterns = [
       /^http:\/\/localhost:\d+$/,
       /^https:\/\/.*\.github\.dev$/,
-      /^https:\/\/.*\.app\.github\.dev$/, 
+      /^https:\/\/.*\.app\.github\.dev$/,
       /^https:\/\/your-production-site\.com$/
     ];
 
@@ -39,3 +39,5 @@ app.use("/api/auth", authRouter);
 app.get('/health', (_req, res) => {
   res.status(200).json({ message: 'ok' });
 });
+
+export default app

@@ -1,5 +1,5 @@
 import http from 'http';
-import { app } from './app.js';
+import app from './app.js';
 import { env } from './config/env.js'; // Use our typed Env
 import { connectDB, disconnectDB } from './config/database.js';
 
