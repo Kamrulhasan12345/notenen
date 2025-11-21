@@ -66,7 +66,6 @@ export const rotateRefreshToken = async (incomingToken: string, meta: TokenMeta)
 
   // 1. REUSE DETECTION: If token doesn't exist or was already revoked/replaced
   if (!oldToken || oldToken.revoked) {
-    // Security Alert: Someone is using a dead token. Revoke EVERYTHING for this user.
     await RefreshTokenModel.updateMany({ userId: payload.sub }, { revoked: true });
     throw new Error("Security Alert: Token reuse detected. All sessions terminated.");
   }
@@ -104,6 +103,5 @@ export const revokeAllForUser = async (userId: string) => {
   await RefreshTokenModel.updateMany({ userId }, { revoked: true });
 
   // 2. Increment tokenVersion on User (invalidates all stateless Access Tokens instantly)
-  // Note: Your authentication middleware needs to check this version!
   await UserModel.findByIdAndUpdate(userId, { $inc: { tokenVersion: 1 } });
 };

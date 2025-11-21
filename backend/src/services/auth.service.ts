@@ -60,13 +60,13 @@ export async function refreshTokens(token: string, meta: AuthMeta) {
 }
 
 export async function logout(token: string) {
-  try {
-    const payload = TokenService.verifyRefreshToken(token);
-    await TokenService.revokeToken(payload.jti);
-  } catch (e) {
-    // Ignore errors during logout (e.g., token already invalid)
-    // We don't want to block the user from "logging out" on the client side
-  }
+  // try {
+  const payload = TokenService.verifyRefreshToken(token);
+  await TokenService.revokeToken(payload.jti);
+  // } catch (e) {
+  //   // Ignore errors during logout (e.g., token already invalid)
+  //   // We don't want to block the user from "logging out" on the client side
+  // }
 }
 
 export const logoutAll = TokenService.revokeAllForUser;

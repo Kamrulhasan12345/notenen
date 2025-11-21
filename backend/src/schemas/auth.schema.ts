@@ -15,10 +15,9 @@ export const registerSchema = z.object({
     name: nameRule,
     email: emailRule,
     password: passwordRule,
-  }).strict(), // .strict() strips unknown extra fields (security)
+  }).strict(),
 });
 
-// Extract the TS Type for use in Controller
 export type RegisterInput = z.infer<typeof registerSchema>["body"];
 
 
@@ -28,8 +27,6 @@ export type RegisterInput = z.infer<typeof registerSchema>["body"];
 export const loginSchema = z.object({
   body: z.object({
     email: emailRule,
-    // Don't enforce min(8) on login to prevent leaking policy info 
-    // and allow legacy users with short passwords to still login.
     password: z.string().min(1, "Password is required"),
   }).strict(),
 });

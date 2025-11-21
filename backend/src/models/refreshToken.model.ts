@@ -10,7 +10,6 @@ const RefreshTokenSchema = new Schema({
   ip: { type: String, default: null },
 }, { timestamps: true });
 
-// TTL Index: Automatically remove document 0 seconds after 'expiresAt'
 RefreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export type RefreshToken = InferSchemaType<typeof RefreshTokenSchema>;
