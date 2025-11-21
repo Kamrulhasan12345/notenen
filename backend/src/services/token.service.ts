@@ -5,16 +5,16 @@ import { UserModel } from "../models/user.model.js";
 import { env, getExpiryDate } from "../config/env.js";
 
 // Types
-type AccessPayload = { sub: string, tv: number }; // 'sub' is standard for User ID
+type AccessPayload = { sub: string }; // 'sub' is standard for User ID
 type RefreshPayload = { sub: string; jti: string };
 type TokenMeta = { ip: string; deviceInfo: string };
 
 /**
  * Issue a short-lived Access Token (Stateless)
  */
-export const signAccessToken = (userId: string, tokenVersion: number) => {
+export const signAccessToken = (userId: string) => {
   return jwt.sign(
-    { sub: userId, tv: tokenVersion } as AccessPayload,
+    { sub: userId } as AccessPayload,
     env.JWT_SECRET,
     { expiresIn: env.TOKEN_EXPIRES_IN }
   );
