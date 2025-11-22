@@ -2,6 +2,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import authRouter from "./routes/auth.routes.js"; // Import the router
+import { errorHandler } from "./middlewares/error.middleware.js";
 
 
 export const app = express();
@@ -39,5 +40,8 @@ app.use("/api/auth", authRouter);
 app.get('/health', (_req, res) => {
   res.status(200).json({ message: 'ok' });
 });
+
+
+app.use(errorHandler)
 
 export default app
