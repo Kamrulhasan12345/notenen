@@ -2,6 +2,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import authRouter from "./routes/auth.routes.js"; // Import the router
+import noteRouter from "./routes/note.routes.js"; // Import the router
 import { errorHandler } from "./middlewares/error.middleware.js";
 
 
@@ -35,6 +36,7 @@ app.use(cookieParser());
 app.use(express.json());
 
 app.use("/api/auth", authRouter);
+app.use("/api/notes", noteRouter);
 
 
 app.get('/health', (_req, res) => {

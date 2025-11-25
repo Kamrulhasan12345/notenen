@@ -2,12 +2,15 @@ import http from 'http';
 import app from './app.js';
 import { env } from './config/env.js'; // Use our typed Env
 import { connectDB, disconnectDB } from './config/database.js';
+import { initSocket } from './socket.js';
 
 const startServer = async () => {
   // 1. Connect to Database
   await connectDB();
 
   const server = http.createServer(app);
+
+  initSocket(server);
 
   // 2. Start Server
   server.listen(env.PORT, () => {
