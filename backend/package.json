@@ -27,7 +27,7 @@
     "http-errors": "^2.0.1",
     "jsonwebtoken": "^9.0.2",
     "lib0": "^0.2.114",
-    "mongoose": "^8.20.0",
+    "mongoose": "^8.20.1",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
     "uuid": "^13.0.0",
