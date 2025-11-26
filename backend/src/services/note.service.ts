@@ -3,9 +3,9 @@ import { NoteModel } from "../models/note.model.js";
 
 // Helper: Standardized Access Check
 export const checkPermission = (note: any, userId: string, level: 'read' | 'write' | 'manage') => {
-  const uid = userId.toString();
-  const isOwner = note.owner.toString() === uid;
-  const member = note.members.find((m: any) => m.user.toString() === uid);
+  // Fix 2: Use .equals() for robust ID comparison
+  const isOwner = note.owner.equals(userId);
+  const member = note.members.find((m: any) => m.user.equals(userId));
 
   if (isOwner) return true;
   if (!member) return false;
@@ -43,7 +43,7 @@ export async function getNotes(userId: string) {
       { "members.user": userId }
     ]
   })
-    .select("title content updatedAt owner members") // Exclude heavy 'documentState'
+    .select("title contentPreview updatedAt owner members") // Exclude heavy 'documentState'
     .sort({ updatedAt: -1 })
     .populate("owner", "name email");
 }
@@ -89,7 +89,7 @@ export async function deleteNote(noteId: string, userId: string) {
   if (!note) throw createError(404, "Note not found");
 
   // STRICT: Only Owner can delete
-  if (note.owner.toString() !== userId) {
+  if (!note.owner.equals(userId)) {
     throw createError(403, "Only the owner can delete this note");
   }
 
@@ -100,20 +100,25 @@ export async function deleteNote(noteId: string, userId: string) {
 /**
  * SHARE Note (Add Member)
  */
-export async function inviteUser(noteId: string, ownerId: string, targetUserId: string, role: 'viewer' | 'editor') {
+export async function inviteUser(noteId: string, sharingUserId: string, targetUserId: string, role: 'viewer' | 'editor') {
   const note = await NoteModel.findById(noteId);
   if (!note) throw createError(404, "Note not found");
 
-  if (!checkPermission(note, ownerId, 'manage')) {
+  if (!checkPermission(note, sharingUserId, 'manage')) {
     throw createError(403, "Only the owner can manage members");
   }
 
-  // Remove if already exists to prevent duplicates
-  note.members = note.members.filter((m: any) => m.user.toString() !== targetUserId) as any;
+  await NoteModel.updateOne(
+    { _id: noteId },
+    { $pull: { members: { user: targetUserId } } }
+  );
 
-  // Add new role
-  note.members.push({ user: targetUserId as any, role });
+  // 2. Atomically add the new user and role.
+  const updatedNote = await NoteModel.findOneAndUpdate(
+    { _id: noteId },
+    { $push: { members: { user: targetUserId, role } } },
+    { new: true } // Return the updated document
+  ).populate("owner", "name email");
 
-  await note.save();
-  return note;
+  return updatedNote;
 }

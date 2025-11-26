@@ -13,7 +13,7 @@ const getOrCreateDoc = async (noteId: string): Promise<DocumentHandler> => {
     doc.handleConnect();
     return doc;
   }
-  const doc = new DocumentHandler(noteId, (id) => docs.delete(id));
+  const doc = new DocumentHandler(noteId, (id: string) => docs.delete(id));
   await doc.load();
   docs.set(noteId, doc);
   doc.handleConnect();
@@ -24,23 +24,39 @@ export const handleYjsSync = async (socket: Socket, noteId: string, canWrite: bo
   const handler = await getOrCreateDoc(noteId);
   const doc = handler.doc;
   const awareness = handler.awareness;
-  const userId = socket.data.user._id.toString(); // Authenticated User ID
+  const userId = socket.data.user._id.toString();
 
-  // 1. TRACKING: Only remove cursors owned by this socket
   const myClientIds = new Set<number>();
 
-  // 2. SETUP PROTOCOL: Send Sync Step 1
+  // Send Sync Step 1
   const encoder = encoding.createEncoder();
-  encoding.writeVarUint(encoder, 0); // Sync
+  encoding.writeVarUint(encoder, 0);
   syncProtocol.writeSyncStep1(encoder, doc);
   socket.emit("yjs_message", encoding.toUint8Array(encoder));
 
-  // 3. LISTENERS
+  const states = awareness.getStates();
+  if (states.size > 0) {
+    const awarenessEncoder = encoding.createEncoder();
+    encoding.writeVarUint(awarenessEncoder, 1); // Message Type 1: Awareness
 
-  // A. Doc Updates (Broadcast to client)
+    // Get ALL client IDs currently in the map
+    const clients = Array.from(states.keys());
+
+    // Encode the state of all these clients
+    const buff = awarenessProtocol.encodeAwarenessUpdate(awareness, clients);
+
+    encoding.writeVarUint8Array(awarenessEncoder, buff);
+    socket.emit("yjs_message", encoding.toUint8Array(awarenessEncoder));
+  }
+
+
+  // ==================================================
+  // 1. DOC UPDATE HANDLER
+  // ==================================================
   const onDocUpdate = (update: Uint8Array, origin: any) => {
-    // Echo suppression: Don't send if origin is self or db-load
-    if (origin === userId || origin === 'db-load') return;
+    // Check SOCKET ID to suppress echo
+    if (origin && origin.socketId === socket.id) return;
+    if (origin === 'db-load') return;
 
     const enc = encoding.createEncoder();
     encoding.writeVarUint(enc, 0);
@@ -49,85 +65,71 @@ export const handleYjsSync = async (socket: Socket, noteId: string, canWrite: bo
   };
   doc.on('update', onDocUpdate);
 
-  // B. Awareness Updates (Broadcast & Track Own Cursors)
+  // ==================================================
+  // 2. AWARENESS HANDLER (Fixed)
+  // ==================================================
   const onAwarenessUpdate = ({ added, updated, removed }: any, origin: any) => {
-    // If this socket created the cursor, track the ID
     if (origin === socket) {
       added.forEach((id: number) => myClientIds.add(id));
     }
-    // Broadcast to client (unless it's their own)
+
+    // Broadcast to others
     if (origin !== socket) {
       const enc = encoding.createEncoder();
       encoding.writeVarUint(enc, 1);
+
+      // ✅ FIX: Encode to buffer first, then write to encoder
       const update = awarenessProtocol.encodeAwarenessUpdate(awareness, added.concat(updated).concat(removed));
       encoding.writeVarUint8Array(enc, update);
+
       socket.emit("yjs_message", encoding.toUint8Array(enc));
     }
   };
   awareness.on('update', onAwarenessUpdate);
 
-  // 4. HANDLE INCOMING
+  // ==================================================
+  // 3. INCOMING MESSAGE HANDLER
+  // ==================================================
   socket.on("yjs_message", (buffer) => {
     try {
       const update = new Uint8Array(buffer);
       const decoder = decoding.createDecoder(update);
       const messageType = decoding.readVarUint(decoder);
 
-      // CASE: SYNC
-      if (messageType === 0) {
-        // SECURITY: If viewer, we allow Sync Step 1/2 (Reads), but we shouldn't apply Updates.
-        // However, Yjs protocol mixes them. 
-        // For strict security, we use 'canWrite'.
-
+      if (messageType === 0) { // Sync
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, 0);
 
-        // Apply to Doc
-        // CRITICAL: Pass 'userId' as origin. 
-        // This tells DocumentHandler: "This update came from User 123" -> Save to DB.
+        const origin = { userId, socketId: socket.id };
+
         doc.transact(() => {
-          // If Read-Only, we *could* try to parse and block updates, 
-          // but simplest is to allow the sync state read but prevent mutation if possible.
-          // Since separating read/write in syncProtocol is hard:
-
           if (canWrite) {
-            syncProtocol.readSyncMessage(decoder, encoder, doc, userId);
+            syncProtocol.readSyncMessage(decoder, encoder, doc, origin);
           } else {
-            // If they are read-only, we should ideally only process Step 1/2 requests.
-            // But 'readSyncMessage' does both. 
-            // In a custom server, you'd usually trust the client (Viewers don't send updates)
-            // or use a deeper decoder. 
-            // For now, we apply it. If you want strict RO, you need to parse the sync message manually.
-            syncProtocol.readSyncMessage(decoder, encoder, doc, userId);
+            syncProtocol.readSyncMessage(decoder, encoder, doc, origin);
           }
-        }, userId);
+        }, origin);
 
-        // Reply
         if (encoding.length(encoder) > 1) {
           socket.emit("yjs_message", encoding.toUint8Array(encoder));
         }
       }
-
-      // CASE: AWARENESS
-      else if (messageType === 1) {
-        // CRITICAL: Pass 'socket' as origin to track ownership
+      else if (messageType === 1) { // Awareness
         awarenessProtocol.applyAwarenessUpdate(awareness, decoding.readVarUint8Array(decoder), socket);
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   });
 
-  // 5. CLEANUP
   socket.on("disconnect", () => {
+    console.log(`[${noteId} ${userId}] closer to my death ig`)
+
     doc.off('update', onDocUpdate);
     awareness.off('update', onAwarenessUpdate);
-
-    // Remove ONLY my cursors
     if (myClientIds.size > 0) {
       awarenessProtocol.removeAwarenessStates(awareness, Array.from(myClientIds), null);
     }
-
     handler.handleDisconnect();
+
+    console.log(`[${noteId} ${userId}] dead xd`)
   });
 };

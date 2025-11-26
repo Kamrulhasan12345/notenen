@@ -31,11 +31,16 @@ export class DocumentHandler {
 
     // CRITICAL: The listener that captures updates from Yjs
     this.doc.on('update', (update: Uint8Array, origin: any) => {
-      // 1. FILTER: Ignore updates that came from Loading DB
       if (origin === 'db-load') return;
 
-      // 2. CAPTURE: If origin is a userId string, use it.
-      const sender = typeof origin === 'string' ? origin : this.lastSenderId;
+      // Logic to find the User ID string
+      let sender = this.lastSenderId;
+
+      if (typeof origin === 'string') {
+        sender = origin;
+      } else if (typeof origin === 'object' && origin !== null && origin.userId) {
+        sender = origin.userId; // Extract it from the object
+      }
 
       if (sender) {
         this.bufferUpdate(update, sender);
@@ -107,7 +112,10 @@ export class DocumentHandler {
 
       if (this.saveCount >= 50) {
         await this.compact();
+        console.log(`[${this.noteId}] compacted from flushBuffer`)
       }
+
+      console.log(`[${this.noteId}] yeah saved it in flushBuffer`)
     } catch (err) {
       console.error(`[${this.noteId}] Save failed:`, err);
     }
@@ -130,6 +138,7 @@ export class DocumentHandler {
     });
 
     await NoteUpdateModel.deleteMany({ noteId: this.noteId });
+    console.log(`[${this.noteId}] compacted successfully`)
   }
 
   // ==========================================
@@ -145,18 +154,22 @@ export class DocumentHandler {
 
   handleDisconnect() {
     this.activeConnections--;
+    console.log(`[${this.noteId}] yoo we're -1. current: ${this.activeConnections}`)
     if (this.activeConnections <= 0) {
       this.gcTimeout = setTimeout(() => {
         this.destroy();
       }, 30000);
     }
+    console.log(`[${this.noteId}] yeah actually -1`)
   }
 
   async destroy() {
+    console.log(`${this.noteId} nuclear blast`)
     await this.flushBuffer();
+    await this.compact();
     this.awareness.destroy(); // Stop memory leak
     this.doc.destroy();
     this.cleanupCallback(this.noteId);
-    console.log(`[${this.noteId}] Destroyed.`);
+    console.log(`[${this.noteId}] Destroyed xd.`);
   }
 }

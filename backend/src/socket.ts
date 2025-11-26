@@ -67,6 +67,8 @@ export const initSocket = (httpServer: HttpServer) => {
 
         socket.join(noteId);
         await handleYjsSync(socket, noteId, canWrite);
+
+        socket.emit("note_joined", { noteId });
         console.log(`User ${userId} joined note ${noteId}`)
       } catch (e) {
         console.error("Error joining note:", e);
