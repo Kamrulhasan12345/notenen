@@ -7,6 +7,7 @@ import UserModel from "./models/user.model.js";
 import { handleYjsSync } from "./socket/yjsHandler.js";
 import { NoteModel } from "./models/note.model.js";
 import { checkPermission } from "./services/note.service.js";
+import { yo } from "zod/locales";
 
 let io: Server
 
@@ -39,7 +40,7 @@ export const initSocket = (httpServer: HttpServer) => {
 
   io.on("connection", (socket: Socket) => {
     const user = socket.data.user;
-    console.log(`✅ User connected: ${user.name} (${user._id}) - Socket ID: ${socket.id}`);
+    console.log(`User connected: ${user.name} (${user._id}) - Socket ID: ${socket.id}`);
 
     socket.on('ping', (data) => {
       console.log("Received ping:", data);
@@ -47,7 +48,8 @@ export const initSocket = (httpServer: HttpServer) => {
     })
 
     socket.on('disconnect', () => {
-      console.log(`❌ User disconnected: ${user.name}`);
+      console.log(`User disconnected: ${user.name}`);
+      // then remove him from the room and check if everybody in the room is gone to clean up yjs document
     })
 
     socket.on("join_note", async ({ noteId }) => {
@@ -60,8 +62,11 @@ export const initSocket = (httpServer: HttpServer) => {
           return socket.emit("error", "Access Denied");
         }
 
+        // Check Write Access
+        const canWrite = checkPermission(note, userId, 'write'); // Assuming your service has this
+
         socket.join(noteId);
-        await handleYjsSync(socket, noteId);
+        await handleYjsSync(socket, noteId, canWrite);
         console.log(`User ${userId} joined note ${noteId}`)
       } catch (e) {
         console.error("Error joining note:", e);

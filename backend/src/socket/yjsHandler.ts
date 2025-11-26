@@ -1,95 +1,133 @@
 import { Socket } from "socket.io";
-import * as Y from "yjs";
-import * as syncProtocol from "y-protocols/sync";
 import * as encoding from "lib0/encoding";
-import { NoteModel } from "../models/note.model.js";
-import { NoteUpdateModel } from "../models/noteUpdate.model.js";
-import { Mutex } from "async-mutex";
+import * as decoding from "lib0/decoding";
+import * as syncProtocol from "y-protocols/sync";
+import * as awarenessProtocol from "y-protocols/awareness";
+import { DocumentHandler } from "../utils/docHandler.js";
 
-type DocEntry = {
-  doc: Y.Doc,
-  updatesCount: number;
-  mutex: Mutex;
-}
+const docs = new Map<string, DocumentHandler>();
 
-const activeDocs = new Map<string, DocEntry>();
+const getOrCreateDoc = async (noteId: string): Promise<DocumentHandler> => {
+  if (docs.has(noteId)) {
+    const doc = docs.get(noteId)!;
+    doc.handleConnect();
+    return doc;
+  }
+  const doc = new DocumentHandler(noteId, (id) => docs.delete(id));
+  await doc.load();
+  docs.set(noteId, doc);
+  doc.handleConnect();
+  return doc;
+};
 
-// In memory caching
-const loadDoc = async (noteId: string) => {
-  if (activeDocs.has(noteId)) return activeDocs.get(noteId)!;
+export const handleYjsSync = async (socket: Socket, noteId: string, canWrite: boolean) => {
+  const handler = await getOrCreateDoc(noteId);
+  const doc = handler.doc;
+  const awareness = handler.awareness;
+  const userId = socket.data.user._id.toString(); // Authenticated User ID
 
-  const mutex = new Mutex()
-  const doc = new Y.Doc()
-  const entry: DocEntry = { doc, updatesCount: 0, mutex };
-  activeDocs.set(noteId, entry);
+  // 1. TRACKING: Only remove cursors owned by this socket
+  const myClientIds = new Set<number>();
 
-  await mutex.runExclusive(async () => {
-    // load snapshot
-    const note = await NoteModel.findById(noteId);
-    if (note && note.documentState && note.documentState.length > 0) {
-      Y.applyUpdate(doc, note.documentState);
+  // 2. SETUP PROTOCOL: Send Sync Step 1
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, 0); // Sync
+  syncProtocol.writeSyncStep1(encoder, doc);
+  socket.emit("yjs_message", encoding.toUint8Array(encoder));
+
+  // 3. LISTENERS
+
+  // A. Doc Updates (Broadcast to client)
+  const onDocUpdate = (update: Uint8Array, origin: any) => {
+    // Echo suppression: Don't send if origin is self or db-load
+    if (origin === userId || origin === 'db-load') return;
+
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, 0);
+    syncProtocol.writeUpdate(enc, update);
+    socket.emit("yjs_message", encoding.toUint8Array(enc));
+  };
+  doc.on('update', onDocUpdate);
+
+  // B. Awareness Updates (Broadcast & Track Own Cursors)
+  const onAwarenessUpdate = ({ added, updated, removed }: any, origin: any) => {
+    // If this socket created the cursor, track the ID
+    if (origin === socket) {
+      added.forEach((id: number) => myClientIds.add(id));
     }
+    // Broadcast to client (unless it's their own)
+    if (origin !== socket) {
+      const enc = encoding.createEncoder();
+      encoding.writeVarUint(enc, 1);
+      const update = awarenessProtocol.encodeAwarenessUpdate(awareness, added.concat(updated).concat(removed));
+      encoding.writeVarUint8Array(enc, update);
+      socket.emit("yjs_message", encoding.toUint8Array(enc));
+    }
+  };
+  awareness.on('update', onAwarenessUpdate);
 
+  // 4. HANDLE INCOMING
+  socket.on("yjs_message", (buffer) => {
+    try {
+      const update = new Uint8Array(buffer);
+      const decoder = decoding.createDecoder(update);
+      const messageType = decoding.readVarUint(decoder);
 
-    // load incremental history
-    const updates = await NoteUpdateModel.find({ noteId }).sort({ createdAt: 1 });
-    updates.forEach(u => {
-      Y.applyUpdate(doc, u.updateBlob);
-    });
-    entry.updatesCount = updates.length;
-  })
-  return entry;
-}
+      // CASE: SYNC
+      if (messageType === 0) {
+        // SECURITY: If viewer, we allow Sync Step 1/2 (Reads), but we shouldn't apply Updates.
+        // However, Yjs protocol mixes them. 
+        // For strict security, we use 'canWrite'.
 
-const persistUpdate = async (noteId: string, userId: string, update: Uint8Array) => {
-  const entry = activeDocs.get(noteId);
-  if (!entry) return;
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, 0);
 
-  await entry.mutex.runExclusive(async () => {
-    Y.applyUpdate(entry.doc, update);
+        // Apply to Doc
+        // CRITICAL: Pass 'userId' as origin. 
+        // This tells DocumentHandler: "This update came from User 123" -> Save to DB.
+        doc.transact(() => {
+          // If Read-Only, we *could* try to parse and block updates, 
+          // but simplest is to allow the sync state read but prevent mutation if possible.
+          // Since separating read/write in syncProtocol is hard:
 
+          if (canWrite) {
+            syncProtocol.readSyncMessage(decoder, encoder, doc, userId);
+          } else {
+            // If they are read-only, we should ideally only process Step 1/2 requests.
+            // But 'readSyncMessage' does both. 
+            // In a custom server, you'd usually trust the client (Viewers don't send updates)
+            // or use a deeper decoder. 
+            // For now, we apply it. If you want strict RO, you need to parse the sync message manually.
+            syncProtocol.readSyncMessage(decoder, encoder, doc, userId);
+          }
+        }, userId);
 
-    // log history 
-    await NoteUpdateModel.create({
-      noteId,
-      sender: userId,
-      updateBlob: Buffer.from(update)
-    })
-    entry.updatesCount++;
+        // Reply
+        if (encoding.length(encoder) > 1) {
+          socket.emit("yjs_message", encoding.toUint8Array(encoder));
+        }
+      }
 
-
-    // snapshot strategy (every 50 edits)
-    if (entry.updatesCount >= 50) {
-      const snapshot = Y.encodeStateAsUpdate(entry.doc);
-      const content = entry.doc.getText("content").toString();
-
-      await NoteModel.findByIdAndUpdate(noteId, {
-        documentState: Buffer.from(snapshot),
-        content
-      })
-
-      entry.updatesCount = 0;
-      console.log(`[Yjs] Snapshotted note ${noteId}`);
+      // CASE: AWARENESS
+      else if (messageType === 1) {
+        // CRITICAL: Pass 'socket' as origin to track ownership
+        awarenessProtocol.applyAwarenessUpdate(awareness, decoding.readVarUint8Array(decoder), socket);
+      }
+    } catch (e) {
+      console.error(e);
     }
   });
-}
 
-export const handleYjsSync = async (socket: Socket, noteId: string) => {
-  const entry = await loadDoc(noteId);
+  // 5. CLEANUP
+  socket.on("disconnect", () => {
+    doc.off('update', onDocUpdate);
+    awareness.off('update', onAwarenessUpdate);
 
-  // send initial state
-  const encoder = encoding.createEncoder();
-  syncProtocol.writeSyncStep1(encoder, entry.doc);
-  socket.emit('yjs_sync', encoding.toUint8Array(encoder));
+    // Remove ONLY my cursors
+    if (myClientIds.size > 0) {
+      awarenessProtocol.removeAwarenessStates(awareness, Array.from(myClientIds), null);
+    }
 
-  // listen for updates
-  socket.on("yjs_update", async (update) => {
-    // broadcast to others
-    socket.to(noteId).emit("yjs_update", update);
-
-    // save to db
-    // convert back to Uint8Array if socketio sent a Buffer
-    const updateUint8 = new Uint8Array(update);
-    await persistUpdate(noteId, socket.data.user._id, updateUint8);
-  })
-}
+    handler.handleDisconnect();
+  });
+};

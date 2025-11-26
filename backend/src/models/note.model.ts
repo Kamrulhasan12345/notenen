@@ -14,7 +14,7 @@ const NoteSchema = new Schema({
       role: { type: String, enum: ["editor", "viewer"], default: "viewer" }
     }
   ]
-})
+}, { timestamps: true });
 
 export type Note = InferSchemaType<typeof NoteSchema>;
 export const NoteModel = model<Note>("NoteNenNote", NoteSchema);
