@@ -69,22 +69,23 @@ export const handleYjsSync = async (socket: Socket, noteId: string, canWrite: bo
   // 2. AWARENESS HANDLER (Fixed)
   // ==================================================
   const onAwarenessUpdate = ({ added, updated, removed }: any, origin: any) => {
-    if (origin === socket) {
-      added.forEach((id: number) => myClientIds.add(id));
-    }
+  // Track this socket's client IDs
+  if (origin === socket) {
+    added.forEach((id: number) => myClientIds.add(id));
+  }
 
-    // Broadcast to others
-    if (origin !== socket) {
-      const enc = encoding.createEncoder();
-      encoding.writeVarUint(enc, 1);
-
-      // ✅ FIX: Encode to buffer first, then write to encoder
-      const update = awarenessProtocol.encodeAwarenessUpdate(awareness, added.concat(updated).concat(removed));
-      encoding.writeVarUint8Array(enc, update);
-
-      socket.emit("yjs_message", encoding.toUint8Array(enc));
-    }
-  };
+  // Broadcast awareness changes to OTHER clients in the room
+  const changedClients = added.concat(updated).concat(removed);
+  if (changedClients.length > 0) {
+    const enc = encoding.createEncoder();
+    encoding. writeVarUint(enc, 1);
+    const update = awarenessProtocol.encodeAwarenessUpdate(awareness, changedClients);
+    encoding.writeVarUint8Array(enc, update);
+    
+    // Broadcast to all OTHER sockets in the room
+    socket.broadcast.to(noteId).emit("yjs_message", encoding.toUint8Array(enc));
+  }
+};
   awareness.on('update', onAwarenessUpdate);
 
   // ==================================================
